@@ -12,4 +12,4 @@ An AI-powered multilingual language learning platform with exam preparation for 
 Python · FastAPI · PostgreSQL · React · Anthropic Claude · OpenAI Whisper · ElevenLabs
 
 ## Status
-🚧 In active development — Final Year B.Tech Project
+🚧 In active development — Pre-Final Year B.Tech Project
