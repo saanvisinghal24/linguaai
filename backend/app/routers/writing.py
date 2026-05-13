@@ -1,16 +1,5 @@
-# backend/app/routers/writing.py
-#
-# WHY THIS FILE EXISTS:
-# The writing evaluator is LinguaAI's most impressive feature.
-# It scores essays on 4 official exam rubric dimensions — exactly how
-# a real Goethe or DELF examiner would mark them.
-#
-# The key is the prompt: we give Claude the official rubric criteria
-# and tell it to return structured scores. The output looks and feels
-# like a real examiner's feedback sheet.
-
 import json
-import anthropic
+from groq import Groq
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db
@@ -21,72 +10,56 @@ from app.schemas.schemas import WritingSubmitRequest, WritingEvalResponse
 from app.routers.grammar import _update_progress
 
 router = APIRouter(prefix="/api/writing", tags=["Writing"])
+client = Groq(api_key=settings.GROQ_API_KEY)
 
-client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-
-def build_writing_prompt(text: str, prompt: str, language: str, exam_type: str, level: str) -> str:
+def build_writing_prompt(text, prompt, language, exam_type, level):
     return f"""You are an official {exam_type} examiner evaluating a {language} writing submission at CEFR level {level}.
 
-Writing Prompt given to the student:
-"{prompt}"
+Writing Prompt: "{prompt}"
+Student's Submission: "{text}"
 
-Student's Submission:
-"{text}"
-
-Evaluate this submission using the official {exam_type} rubric. Return ONLY a valid JSON object (no extra text, no markdown):
+Evaluate using the official rubric. Return ONLY valid JSON, no markdown:
 
 {{
-  "task_achievement": {{
-    "score": <number 0-10>,
-    "feedback": "<2-3 sentences: did they answer the prompt fully? Did they cover all required points?>"
-  }},
-  "grammar": {{
-    "score": <number 0-10>,
-    "feedback": "<2-3 sentences: range of structures used, frequency and severity of errors>"
-  }},
-  "vocabulary": {{
-    "score": <number 0-10>,
-    "feedback": "<2-3 sentences: range, precision, appropriateness of vocabulary for {level}>"
-  }},
-  "coherence": {{
-    "score": <number 0-10>,
-    "feedback": "<2-3 sentences: logical flow, use of connectors, paragraph structure>"
-  }},
-  "overall_band": <average of the 4 scores, rounded to 1 decimal>,
-  "model_answer": "<a strong model answer for this prompt at {level} level, approximately the same length as the student's submission>"
-}}"""
+  "task_achievement": {{"score": <0-10>, "feedback": "<2-3 sentences in ENGLISH>"}},
+  "grammar": {{"score": <0-10>, "feedback": "<2-3 sentences in ENGLISH>"}},
+  "vocabulary": {{"score": <0-10>, "feedback": "<2-3 sentences in ENGLISH>"}},
+  "coherence": {{"score": <0-10>, "feedback": "<2-3 sentences in ENGLISH>"}},
+  "overall_band": <average of 4 scores>,
+  "model_answer": "<model answer in {language}>"
+}}
+
+IMPORTANT: ALL feedback must be written in English. Only the model_answer should be in {language}."""
 
 
-@router.post("/submit", response_model=WritingEvalResponse)
+@router.post("/submit")
 def submit_writing(
     data: WritingSubmitRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Evaluate a writing submission using Claude.
-    Returns rubric scores for 4 dimensions + a model answer.
-    """
     if len(data.text.strip()) < 20:
         raise HTTPException(status_code=400, detail="Please write at least a few sentences.")
 
     try:
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=3000,
+        message = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": build_writing_prompt(
                 data.text, data.prompt, data.language, data.exam_type, data.cefr_level
             )}]
         )
-        raw = message.content[0].text.strip()
+        raw = message.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
         result = json.loads(raw)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI returned an unexpected response. Please try again.")
+        raise HTTPException(status_code=500, detail="AI returned unexpected response. Please try again.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
 
-    # Save to database
     submission = WritingSubmission(
         user_id=current_user.id,
         language=data.language,
@@ -102,25 +75,20 @@ def submit_writing(
         model_answer=result["model_answer"]
     )
     db.add(submission)
-
-    # Update writing and vocabulary progress
-    writing_score = result["overall_band"] * 10  # convert 0-10 band to 0-100
-    _update_progress(db, current_user.id, "writing", writing_score)
-    vocab_score = result["vocabulary"]["score"] * 10
-    _update_progress(db, current_user.id, "vocabulary", vocab_score)
-
+    _update_progress(db, current_user.id, "writing", result["overall_band"] * 10)
+    _update_progress(db, current_user.id, "vocabulary", result["vocabulary"]["score"] * 10)
     db.commit()
     db.refresh(submission)
 
-    return WritingEvalResponse(
-        task_achievement=result["task_achievement"],
-        grammar=result["grammar"],
-        vocabulary=result["vocabulary"],
-        coherence=result["coherence"],
-        overall_band=result["overall_band"],
-        model_answer=result["model_answer"],
-        submission_id=submission.id
-    )
+    return {
+        "task_achievement": result["task_achievement"],
+        "grammar": result["grammar"],
+        "vocabulary": result["vocabulary"],
+        "coherence": result["coherence"],
+        "overall_band": result["overall_band"],
+        "model_answer": result["model_answer"],
+        "submission_id": submission.id
+    }
 
 
 @router.get("/history")
@@ -128,11 +96,27 @@ def get_writing_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Return the user's last 10 writing submissions."""
     submissions = db.query(WritingSubmission)\
         .filter(WritingSubmission.user_id == current_user.id)\
         .order_by(WritingSubmission.created_at.desc())\
         .limit(10).all()
-
     return [{"id": s.id, "exam_type": s.exam_type, "overall_band": s.overall_band,
              "created_at": s.created_at} for s in submissions]
+@router.post("/generate-prompt")
+def generate_prompt(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        message = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": f"""Generate ONE realistic {data['exam_type']} writing exam prompt in {data['language']} at CEFR level {data['level']}.
+
+Rules:
+- The prompt must be in {data['language']} (except JLPT/HSK which can be in English)
+- It should require approximately {data['word_count']} words in the response
+- It should be a real exam-style task (letter, essay, email, opinion piece)
+- Include the word count requirement in the prompt itself
+- Make it interesting and relevant to everyday life
+- Return ONLY the prompt text, nothing else"""}]
+        )
+        return {"prompt": message.choices[0].message.content.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not generate prompt: {str(e)}")

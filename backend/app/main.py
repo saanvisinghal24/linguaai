@@ -12,12 +12,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.database import engine, Base
 from app.core.config import settings
+from pydantic import BaseModel
 
 # Import all models so SQLAlchemy knows about them when creating tables
 from app.models import user  # noqa: F401
 
 # Import all routers
-from app.routers import auth, grammar, writing, speaking, flashcards, progress
+from app.routers import auth, grammar, writing, speaking, flashcards, progress, listening, settings
 
 # Create the FastAPI app
 app = FastAPI(
@@ -32,7 +33,7 @@ app = FastAPI(
 # Without this, the browser blocks all requests between different ports/domains.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:5173"],
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],   # allow GET, POST, PUT, DELETE etc.
     allow_headers=["*"],   # allow Authorization header (for JWT)
@@ -47,6 +48,8 @@ app.include_router(writing.router)
 app.include_router(speaking.router)
 app.include_router(flashcards.router)
 app.include_router(progress.router)
+app.include_router(listening.router)
+app.include_router(settings.router)
 
 
 # ─── Create Database Tables ──────────────────────────────────────────────────
@@ -67,3 +70,19 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+class TextInput(BaseModel):
+    text: str
+
+@app.post("/grammar-check")
+def grammar_check(data: TextInput):
+    text = data.text
+    
+    # temporary logic (you will replace with AI later)
+    corrected = text.capitalize()
+    
+    return {
+        "original": text,
+        "corrected": corrected,
+        "message": "Basic correction applied"
+    }

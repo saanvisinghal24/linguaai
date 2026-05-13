@@ -1,61 +1,41 @@
-# backend/app/routers/speaking.py
-#
-# WHY THIS FILE EXISTS:
-# This is the most technically complex module.
-# The pipeline is: Audio → Whisper (text) → Claude (reply) → ElevenLabs (voice)
-#
-# Each step is an API call. We chain them together here.
-# The frontend sends an audio file, we return text + audio.
-
 import json
 import os
 import tempfile
-import anthropic
-from openai import OpenAI
-from elevenlabs.client import ElevenLabs
+from groq import Groq
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.core.config import settings
-from app.models.user import User, SpeakingSession, UserProgress
-from app.schemas.schemas import SpeakingReplyResponse, FluencyReportResponse
+from app.models.user import User, SpeakingSession
 from app.routers.grammar import _update_progress
 
 router = APIRouter(prefix="/api/speaking", tags=["Speaking"])
+groq_client = Groq(api_key=settings.GROQ_API_KEY)
 
-claude = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-whisper = OpenAI(api_key=settings.OPENAI_API_KEY)
-tts = ElevenLabs(api_key=settings.ELEVENLABS_API_KEY)
+LANGUAGE_CODES = {
+    "German": "de", "French": "fr", "Spanish": "es",
+    "Japanese": "ja", "Chinese": "zh", "Italian": "it",
+    "Korean": "ko", "Portuguese": "pt", "Arabic": "ar", "Hindi": "hi"
+}
 
-# ElevenLabs voice IDs for different languages
-# These are public voices from ElevenLabs — you can change them in your account
 VOICE_IDS = {
     "German": "XrExE9yKIg1WjnnlVkGX",
     "French": "MF3mGyEYCl7XYWbV9V6O",
-    "Spanish": "jBpfuIE2acCO8z3wKNLl",
-    "Japanese": "XrExE9yKIg1WjnnlVkGX",  # fallback
     "default": "XrExE9yKIg1WjnnlVkGX"
 }
 
-def get_system_prompt(language: str, level: str, persona: str, conversation_history: list) -> str:
-    """
-    Build the system prompt for the AI speaking partner.
-    The persona makes it behave like a real exam situation.
-    """
+
+def get_system_prompt(language, level, persona):
     if persona and persona != "Free Practice":
         role = f"You are acting as a {persona}. Conduct the conversation exactly as this examiner would in an official exam."
     else:
         role = f"You are a friendly, patient {language} language tutor."
-
     return f"""{role}
-
 Rules:
 - Respond ONLY in {language} (CEFR level {level})
 - Keep responses conversational and natural (2-4 sentences max)
-- If the student makes a grammar error, GENTLY weave the correction into your response naturally
-- Do NOT explicitly say "You made an error" — just model the correct form in your reply
+- If the student makes a grammar error, gently weave the correction into your response naturally
 - Keep vocabulary appropriate for {level} level
 - If the student seems stuck, ask a simpler follow-up question"""
 
@@ -70,76 +50,67 @@ async def speaking_reply(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Main speaking endpoint.
-    1. Save audio to temp file
-    2. Transcribe with Whisper
-    3. Get Claude's response
-    4. Synthesize with ElevenLabs
-    5. Return transcript + text + audio
-    """
-    # Step 1: Save uploaded audio to a temporary file
-    # Whisper needs a file path, not raw bytes
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
         content = await audio.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        # Step 2: Transcribe with Whisper
+        lang_code = LANGUAGE_CODES.get(language, "en")
         with open(tmp_path, "rb") as audio_file:
-            transcription = whisper.audio.transcriptions.create(
-                model="whisper-1",
+            transcription = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3",
                 file=audio_file,
-                language=language[:2].lower()  # "German" → "de", "French" → "fr"
+                language=lang_code
             )
         user_text = transcription.text
 
-        # Step 3: Build conversation history and get Claude's reply
         history = json.loads(conversation_history)
-        messages = []
+        messages = [{"role": "system", "content": get_system_prompt(language, level, persona)}]
         for turn in history:
             messages.append({"role": "user", "content": turn["user"]})
             messages.append({"role": "assistant", "content": turn["assistant"]})
         messages.append({"role": "user", "content": user_text})
 
-        claude_response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=500,
-            system=get_system_prompt(language, level, persona, history),
-            messages=messages
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            max_tokens=300
         )
-        ai_text = claude_response.content[0].text
+        ai_text = response.choices[0].message.content
 
-        # Step 4: Convert Claude's text to speech with ElevenLabs
-        voice_id = VOICE_IDS.get(language, VOICE_IDS["default"])
-        audio_generator = tts.generate(
-            text=ai_text,
-            voice=voice_id,
-            model="eleven_multilingual_v2"
-        )
-        audio_bytes = b"".join(audio_generator)
+        # ElevenLabs TTS
+        try:
+            from elevenlabs.client import ElevenLabs
+            tts = ElevenLabs(api_key=settings.ELEVENLABS_API_KEY)
+            voice_id = VOICE_IDS.get(language, VOICE_IDS["default"])
+            audio_bytes = tts.text_to_speech.convert(
+                voice_id=voice_id,
+                text=ai_text,
+                model_id="eleven_multilingual_v2",
+                output_format="mp3_44100_128"
+            )
+            audio_bytes = b"".join(audio_bytes)
+            audio_hex = audio_bytes.hex()
+        except Exception:
+            audio_hex = ""
 
         return {
             "transcript": user_text,
             "ai_response_text": ai_text,
-            "audio_base64": audio_bytes.hex()  # send as hex, frontend converts to audio
+            "audio_base64": audio_hex
         }
 
     finally:
-        os.unlink(tmp_path)  # always clean up temp file
+        os.unlink(tmp_path)
 
 
-@router.post("/report", response_model=FluencyReportResponse)
+@router.post("/report")
 def get_fluency_report(
     session_data: dict,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Generate a fluency report for the completed conversation.
-    Called when the user ends their speaking session.
-    """
     transcript = session_data.get("transcript", "")
     language = session_data.get("language", "German")
     level = session_data.get("level", "B1")
@@ -152,26 +123,34 @@ def get_fluency_report(
 Here is the student's side of a speaking practice conversation:
 "{transcript}"
 
-Evaluate their speaking performance. Return ONLY a valid JSON object:
+Evaluate their speaking performance. Return ONLY valid JSON with no markdown:
 {{
-  "pronunciation_notes": "<2-3 sentences about likely pronunciation patterns based on their written transcript>",
+  "pronunciation_notes": "<2-3 sentences in English>",
   "grammar_mistakes": ["<mistake 1>", "<mistake 2>"],
-  "vocabulary_feedback": "<2-3 sentences about their vocabulary range and appropriateness>",
-  "band_score": <number 1.0-10.0 reflecting their overall speaking level>,
-  "overall_comment": "<2-3 encouraging sentences with the most important thing to improve>"
+  "vocabulary_feedback": "<2-3 sentences in English>",
+  "band_score": <number 1.0-10.0>,
+  "overall_comment": "<2-3 encouraging sentences in English>"
 }}"""
 
     try:
-        message = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
+        message = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}]
         )
-        result = json.loads(message.content[0].text.strip())
+        raw = message.choices[0].message.content.strip()
+        if "```" in raw:
+            parts = raw.split("```")
+            raw = parts[1] if len(parts) > 1 else parts[0]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start != -1 and end > start:
+            raw = raw[start:end]
+        result = json.loads(raw)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
 
-    # Save session to DB
     speaking_session = SpeakingSession(
         user_id=current_user.id,
         language=language,
@@ -181,14 +160,8 @@ Evaluate their speaking performance. Return ONLY a valid JSON object:
         duration_seconds=session_data.get("duration_seconds", 0)
     )
     db.add(speaking_session)
-
-    # Update progress
-    speaking_score = result["band_score"] * 10
-    _update_progress(db, current_user.id, "speaking", speaking_score)
+    _update_progress(db, current_user.id, "speaking", result["band_score"] * 10)
     db.commit()
     db.refresh(speaking_session)
 
-    return FluencyReportResponse(
-        **result,
-        session_id=speaking_session.id
-    )
+    return {**result, "session_id": speaking_session.id}

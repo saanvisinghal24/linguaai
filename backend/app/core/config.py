@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str
     OPENAI_API_KEY: str
     ELEVENLABS_API_KEY: str
-
+    GEMINI_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
     # App
     APP_ENV: str = "development"
     FRONTEND_URL: str = "http://localhost:5173"
